@@ -1,0 +1,127 @@
+# Curated schema documentation injected into the LLM prompt.
+# `allowed` mirrors the GRANTs in db/init/03_roles.sh; the SQL guard reads it as its allowlist.
+dialect: postgres
+description: >
+  Olist is a Brazilian e-commerce marketplace. Orders span 2016-09 to 2018-10 (sparse before 2017).
+  Currency is Brazilian real (BRL). Text values such as cities and categories are lowercase.
+
+tables:
+  orders:
+    description: One row per order. Central table.
+    columns:
+      order_id: Primary key.
+      customer_id: FK to customers. Unique per order, NOT per person (see glossary).
+      order_status: "One of: delivered, shipped, canceled, unavailable, invoiced, processing, created, approved."
+      order_purchase_timestamp: When the customer placed the order.
+      order_approved_at: Payment approval time. Can be NULL.
+      order_delivered_carrier_date: Handed to carrier. Can be NULL.
+      order_delivered_customer_date: Delivered to customer. NULL if not delivered.
+      order_estimated_delivery_date: Promised delivery date.
+  order_items:
+    description: One row per item in an order. An order can have several items.
+    columns:
+      order_id: FK to orders.
+      order_item_id: Item sequence number within the order (1, 2, 3...).
+      product_id: FK to products.
+      seller_id: FK to sellers.
+      shipping_limit_date: Seller's deadline to hand the item to the carrier.
+      price: Item price in BRL, excluding freight.
+      freight_value: Shipping cost for this item in BRL.
+  order_payments:
+    description: One row per payment instalment/method used on an order. An order can have several rows.
+    columns:
+      order_id: FK to orders.
+      payment_sequential: Sequence number when an order is paid with several methods.
+      payment_type: "One of: credit_card, boleto, voucher, debit_card, not_defined."
+      payment_installments: Number of instalments chosen.
+      payment_value: Amount paid in BRL.
+  order_reviews:
+    description: Customer review scores. Free-text comments are not available.
+    columns:
+      review_id: Not unique; an order may have more than one review row.
+      order_id: FK to orders.
+      review_score: Integer 1 (worst) to 5 (best).
+      review_creation_date: When the satisfaction survey was sent.
+      review_answer_timestamp: When the customer answered.
+  customers:
+    description: One row per customer_id, which is one per order.
+    columns:
+      customer_id: Primary key. Joins to orders.customer_id.
+      customer_unique_id: Identifies the actual person across orders.
+      customer_zip_code_prefix: Zip prefix.
+      customer_city: City, lowercase.
+      customer_state: Two-letter Brazilian state code, e.g. SP, RJ, MG.
+  sellers:
+    description: One row per seller on the marketplace.
+    columns:
+      seller_id: Primary key.
+      seller_zip_code_prefix: Zip prefix.
+      seller_city: City.
+      seller_state: Two-letter state code.
+  products:
+    description: One row per product.
+    columns:
+      product_id: Primary key.
+      product_category_name: Category in Portuguese. Join product_category_translation for English.
+      product_name_length: Characters in the product name.
+      product_description_length: Characters in the description.
+      product_photos_qty: Number of photos.
+      product_weight_g: Weight in grams.
+      product_length_cm: Package length.
+      product_height_cm: Package height.
+      product_width_cm: Package width.
+  product_category_translation:
+    description: Maps Portuguese category names to English.
+    columns:
+      product_category_name: Portuguese name. Joins to products.product_category_name.
+      product_category_name_english: English name.
+
+relationships:
+  - orders.customer_id = customers.customer_id
+  - order_items.order_id = orders.order_id
+  - order_items.product_id = products.product_id
+  - order_items.seller_id = sellers.seller_id
+  - order_payments.order_id = orders.order_id
+  - order_reviews.order_id = orders.order_id
+  - products.product_category_name = product_category_translation.product_category_name
+
+glossary:
+  - term: customer / unique customer
+    rule: Count DISTINCT customers.customer_unique_id. Never count customer_id, which is per order.
+  - term: revenue / sales
+    rule: >
+      SUM(order_items.price) over delivered orders (order_status = 'delivered'). Do NOT add
+      freight_value. Only use price + freight_value when the user explicitly says "including
+      freight" or "including shipping".
+  - term: GMV / total paid
+    rule: SUM(order_payments.payment_value).
+  - term: share of payments / payment mix
+    rule: >
+      By default measure share by value: SUM(payment_value) per payment_type divided by the
+      overall SUM(payment_value), as a percentage of ALL payment types. Use order counts only
+      if the user asks about number of orders or transactions.
+  - term: order count
+    rule: COUNT(DISTINCT orders.order_id). Count distinct, since joins to items or payments repeat orders.
+  - term: late delivery
+    rule: order_delivered_customer_date > order_estimated_delivery_date. Only consider delivered orders.
+  - term: delivery time
+    rule: >
+      Days = EXTRACT(EPOCH FROM (order_delivered_customer_date - order_purchase_timestamp)) / 86400.
+      Subtracting timestamps gives an interval, which ROUND and AVG-with-ROUND cannot take directly.
+  - term: category
+    rule: Use product_category_translation.product_category_name_english when showing categories.
+  - term: average order value
+    rule: SUM(order_items.price) / COUNT(DISTINCT order_id) over delivered orders.
+
+data_quirks:
+  - 610 products have a NULL category, and 13 categories have no English translation. Use LEFT JOIN to product_category_translation and COALESCE to the Portuguese name so these rows are not silently dropped.
+  - About 550 orders have more than one review row. Use AVG(review_score) per order or COUNT(DISTINCT order_id) when counting reviewed orders.
+  - Most orders (96%) are delivered. Canceled and unavailable orders have no delivery date.
+
+query_rules:
+  - Aggregate order_items and order_payments in separate subqueries before joining them together. Joining both to orders directly multiplies rows and inflates sums.
+  - To count how many groups satisfy a HAVING condition, put the grouped query in a subquery and COUNT(*) over it. COUNT with GROUP BY returns one row per group, not a single number.
+  - When the question compares two or more groups (X versus Y, late versus on time), return one row per group in the same result, e.g. GROUP BY a boolean or CASE expression. Do not filter down to only one of the groups.
+  - Apply only the conditions the question states, plus the delivered-orders convention for revenue. Do not add extra filters the user did not ask for.
+  - Use only the tables and columns listed above. If the question cannot be answered with them, say so instead of guessing.
+  - Produce a single read-only SELECT statement for PostgreSQL.
