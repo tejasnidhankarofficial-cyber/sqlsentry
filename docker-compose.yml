@@ -27,6 +27,11 @@ services:
       POSTGRES_PORT: "5432"
     ports:
       - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     depends_on:
       db:
         condition: service_healthy
@@ -38,8 +43,14 @@ services:
       API_URL: http://api:8000
     ports:
       - "127.0.0.1:8501:8501"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:

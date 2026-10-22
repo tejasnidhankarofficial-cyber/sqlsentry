@@ -46,14 +46,15 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # use for AUTH_S
 #    https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce
 #    Unzip into ./data  (geolocation CSV is not used and may be deleted)
 
-# 3. Start Postgres and load the data
-make db && make load
+# 3. Start everything: Postgres, API (:8000) and UI (:8501).
+#    Builds the images, waits until healthy, and loads the data on first run.
+make run
 
-# 4. Start everything
-make up                       # API on :8000, UI on :8501
+# 4. When you're done: stop and remove the containers (your data is kept)
+make stop
 ```
 
-Open <http://127.0.0.1:8501>, log in with any name plus `APP_PASSWORD`. To run without Docker: `make setup`, then `uvicorn app.main:app` and `streamlit run ui/streamlit_app.py`.
+Open <http://127.0.0.1:8501>, log in with any name plus `APP_PASSWORD`. Other commands: `make status`, `make logs`, `make restart`, `make clean` (also deletes the database volume), `make help`. To run without Docker: `make setup`, then `uvicorn app.main:app` and `streamlit run ui/streamlit_app.py`.
 
 Try: *"What are the top 5 product categories by revenue?"*, *"Which 3 states have the slowest delivery?"*, *"What percentage of delivered orders arrived late?"*
 
@@ -122,7 +123,7 @@ What this does and does not show:
 
 ## Deployment notes
 
-- `docker-compose.yml` runs Postgres, API and UI; ports bind to `127.0.0.1`. To host it, put a TLS-terminating reverse proxy in front (Caddy, nginx, or a managed platform) and keep Postgres unexposed.
+- `docker-compose.yml` (started by `make run`) runs Postgres, API and UI; ports bind to `127.0.0.1`. To host it, put a TLS-terminating reverse proxy in front (Caddy, nginx, or a managed platform) and keep Postgres unexposed.
 - Change every password in `.env` and use a fresh `AUTH_SECRET`. The `.env.example` values are placeholders.
 - Set an OpenAI spend limit on the key. The global daily cap (`DAILY_LIMIT_GLOBAL`) is the second line of defence.
 - Free hosting tiers sleep when idle; the first request can take a while.
