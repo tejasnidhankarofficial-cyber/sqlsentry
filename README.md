@@ -1,169 +1,306 @@
-# sqlsentry
+# SQLSentry
 
-A guarded text-to-SQL assistant. Ask data questions in plain English and get back the **SQL, the result table, and a short summary**, with guardrails that make it safe to point an LLM at a database.
+**Ask questions about a database in plain English. Get back the SQL, the results, and an explanation — with checks in place before a generated query reaches PostgreSQL.**
 
-Built on the [Olist Brazilian e-commerce dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) (~100k orders, 8 tables) with FastAPI, PostgreSQL, SQLAlchemy, OpenAI and Streamlit.
+SQLSentry is a guarded text-to-SQL assistant built around the Olist Brazilian e-commerce dataset. It is designed to make database exploration easier for someone who may not know SQL, while keeping the generated queries visible and placing limits on what the application is allowed to run.
 
+The idea is straightforward: let an LLM translate a question into SQL, but let PostgreSQL do the actual querying and calculations. The generated SQL is shown alongside the result, so an answer can be inspected rather than taken on trust.
+
+## What it looks like in practice
+
+You can ask questions such as:
+
+- “What are the top 5 product categories by revenue?”
+- “Which 3 states have the slowest average delivery time?”
+- “How many orders were placed each month in 2017?”
+- “What share of payments is made by credit card?”
+
+SQLSentry uses the database schema and project-specific business definitions to draft a query. The query then passes through a validation layer before it is executed. The interface displays the SQL, result table, and a short natural-language summary. Results can also be downloaded as a CSV.
+
+## How a question becomes an answer
+
+```mermaid
+flowchart TD
+    A[Question in plain English] --> B[Streamlit interface]
+    B --> C[FastAPI: authentication and usage limits]
+    C --> D[OpenAI: generate SQL using the schema card]
+    D --> E[SQL guard: parse and validate]
+    E -->|Approved| F[PostgreSQL read-only role]
+    E -->|Rejected| H[Bounded repair attempt]
+    F -->|Database error| H
+    H --> D
+    F --> G[Query results]
+    G --> I[Show SQL and result table]
+    G --> J[OpenAI summary using up to 20 result rows]
+    J --> I
+    C --> K[Audit log]
 ```
-Question
-  └─ LLM + schema card ──> SQL
-        └─ SQL guard (parse, SELECT-only, table allowlist, LIMIT)
-              └─ execute as a read-only role (timeout, row cap)
-                    ├─ on error: feed the error back to the LLM, retry (max 2)
-                    └─ summarize a capped sample of rows
-                          └─ audit log ──> SQL + table + summary
-```
 
-## Why the LLM is only a translator
+At a high level, the application is split into three parts:
 
-The model never sees or computes over your data. It turns a question into SQL, and Postgres produces the numbers. Every answer is therefore checkable (the SQL is shown), exact (counts and sums are computed by the database), and auditable. It describes what happened; it does not predict. For "will this customer churn?" you still need a model.
+1. **Streamlit** provides the interface where a user signs in, asks a question, views the generated SQL and results, and downloads a CSV.
+2. **FastAPI** handles authentication, request limits, and the query workflow.
+3. **PostgreSQL** stores the Olist data and executes approved queries through a restricted database role.
 
-## Safety model: independent layers
+If a query is rejected by the guard or fails during database execution, the error can be sent back to the SQL generator for a correction. The repair loop is bounded; it does not retry indefinitely.
 
-| Layer | What it does | Where |
-|---|---|---|
-| **SQL guard** | Parses with `sqlglot`. Allows exactly one `SELECT`/`UNION`/CTE query. Rejects writes, DDL, `SELECT INTO`, `FOR UPDATE`, stacked statements, schema-qualified tables, dangerous functions (`pg_sleep`, `pg_read_file`, `set_config`, ...), and blocked columns. Caps `LIMIT`. | [app/sql_guard.py](app/sql_guard.py) |
-| **Read-only DB role** | The query role has `SELECT` on 8 tables only, no access to review comments (column-level grant) or the audit schema, `default_transaction_read_only=on`, and a 5s `statement_timeout`. It does not trust the guard. | [db/init/03_roles.sh](db/init/03_roles.sh) |
-| **Separate audit role** | Can only `INSERT`/`SELECT` on `audit.query_log`. It cannot update or delete history. | [db/init/03_roles.sh](db/init/03_roles.sh) |
-| **Summary sees a sample** | Only the first 20 rows reach the LLM for summarization, not the full result. | [app/summarize.py](app/summarize.py) |
-| **Access control** | Shared-password login, signed expiring tokens, login lockout, per-user daily quota, and a global daily cap. | [app/auth.py](app/auth.py), [app/ratelimit.py](app/ratelimit.py) |
-| **Prompt-injection stance** | The question and the data are treated as untrusted. Safety never depends on the model behaving: the guard and the DB role hold even if it is fooled. | |
+## Why the LLM does not get unrestricted database access
 
-The guard has 70 adversarial tests ([tests/test_sql_guard.py](tests/test_sql_guard.py)), and the DB-role limits were verified against a live database.
+A natural-language interface is useful, but executing arbitrary model-generated SQL would be a risky design. SQLSentry therefore uses multiple checks rather than relying only on a prompt telling the model to behave.
 
-## Quick start
+### 1. SQL validation before execution
 
-Requirements: Docker, Python 3.11+, an OpenAI API key.
+The generated statement is parsed with **SQLGlot** and checked before it reaches the database. The guard:
+
+- accepts one read-only `SELECT` query (including supported CTE and set-operation patterns);
+- restricts queries to the tables listed in the schema allowlist;
+- rejects write and administrative statements such as `INSERT`, `UPDATE`, `DELETE`, `DROP`, and `ALTER`;
+- rejects blocked functions, schema-qualified table references, and restricted review-comment columns; and
+- adds or lowers a `LIMIT` so a query cannot return more than the configured row cap (1,000 by default).
+
+This is an application-level check, not the only line of defence.
+
+### 2. A restricted PostgreSQL role
+
+Approved queries run through a dedicated read-only database role. That role has `SELECT` access only to the application tables and cannot read the free-text review comments or the audit schema. PostgreSQL is also configured with read-only transactions and a statement timeout (5 seconds by default).
+
+The database permissions are intentionally independent of the SQL guard. If a query somehow gets past the application check, the database role still limits what it can do.
+
+### 3. A separate audit role
+
+Query history is written through a separate database role that can insert and read audit records, but cannot update or delete them. The audit log records information such as the username, question, generated and final SQL, status, number of attempts, row count, and latency.
+
+### 4. Authentication and usage limits
+
+The API uses a shared application password and signed, expiring bearer tokens. It also includes login throttling, an optional username allowlist, a daily per-user question limit, and a global daily limit.
+
+### 5. Limited data sent for summaries
+
+PostgreSQL computes the query result. The summarization step receives only a capped sample of up to 20 result rows, along with the column names and row-count information, to write a short explanation. The full result table is returned to the interface separately, subject to the configured result cap.
+
+## The data behind SQLSentry
+
+The project currently uses the [Olist Brazilian E-Commerce Public Dataset on Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce). It contains marketplace orders and related information from 2016 to 2018. SQLSentry loads eight CSV files into PostgreSQL:
+
+| Table | What it contains |
+|---|---|
+| `orders` | Order status and purchase/delivery timestamps |
+| `order_items` | Products, sellers, item prices, and freight values |
+| `order_payments` | Payment types, values, and instalments |
+| `order_reviews` | Review scores and timestamps |
+| `customers` | Customer and location information |
+| `sellers` | Seller and location information |
+| `products` | Product attributes and Portuguese category names |
+| `product_category_translation` | Portuguese-to-English category names |
+
+The geolocation CSV is not used. The dataset files are not included in this repository; you need to download them from Kaggle and place the required CSVs in `data/` before starting the application.
+
+### Teaching the system what business terms mean
+
+A database schema tells a model which columns exist, but it does not always explain what a business question means. SQLSentry uses [`db/schema_card.yaml`](db/schema_card.yaml) to provide table descriptions, relationships, business definitions, data quirks, and query rules alongside the schema.
+
+A few examples of why that matters:
+
+- **Unique customers:** count `customer_unique_id`, not `customer_id`. The latter is associated with an order, not a distinct person.
+- **Revenue:** by default, calculate item revenue from delivered orders using `order_items.price`. Freight is excluded unless shipping is explicitly requested.
+- **Order counts:** count distinct order IDs when joins could repeat an order.
+- **Items and payments:** aggregate them separately before joining them to orders, so multiple items and multiple payment rows do not accidentally inflate totals.
+
+These definitions are part of the application logic, not just explanatory notes in the README. The schema card is used both when prompting the model and when deriving the table allowlist for validation.
+
+## Technology stack
+
+| Area | Tools |
+|---|---|
+| Language | Python 3.11+ |
+| LLM integration | OpenAI API (default model: `gpt-4o-mini`, configurable) |
+| API | FastAPI, Pydantic |
+| User interface | Streamlit |
+| Database | PostgreSQL 16, SQLAlchemy, Psycopg |
+| SQL validation | SQLGlot |
+| Data handling | Pandas, PyYAML |
+| Containerization | Docker, Docker Compose |
+| Testing and evaluation | Pytest, execution-based golden-query evaluation |
+
+## Run SQLSentry locally
+
+### Prerequisites
+
+- Docker Desktop or Docker Engine with the Docker Compose plugin
+- An OpenAI API key
+- A Kaggle account to download the dataset
+
+The Docker image uses Python 3.11, so you do not need to install the project dependencies on your host just to run the application with Docker Compose.
+
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/tejasnidhankarofficial-cyber/sqlsentry.git && cd sqlsentry
-
-# 1. Configure
-cp .env.example .env          # then edit: OPENAI_API_KEY, APP_PASSWORD, AUTH_SECRET, DB passwords
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # use for AUTH_SECRET
-
-# 2. Get the data (Kaggle login required; the CSVs are not in this repo)
-#    https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce
-#    Unzip into ./data  (geolocation CSV is not used and may be deleted)
-
-# 3. Start everything: Postgres, API (:8000) and UI (:8501).
-#    Builds the images, waits until healthy, and loads the data on first run.
-make run
-
-# 4. When you're done: stop and remove the containers (your data is kept)
-make stop
+git clone https://github.com/tejasnidhankarofficial-cyber/sqlsentry.git
+cd sqlsentry
 ```
 
-Open <http://127.0.0.1:8501>, log in with any name plus `APP_PASSWORD`. Other commands: `make status`, `make logs`, `make restart`, `make clean` (also deletes the database volume), `make help`. To run without Docker: `make setup`, then `uvicorn app.main:app` and `streamlit run ui/streamlit_app.py`.
+### 2. Download the Olist dataset
 
-Try: *"What are the top 5 product categories by revenue?"*, *"Which 3 states have the slowest delivery?"*, *"What percentage of delivered orders arrived late?"*
+Download and extract the [Olist dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) into the repository's `data/` directory. SQLSentry expects these eight files:
 
-### API
+```text
+data/
+├── olist_customers_dataset.csv
+├── olist_sellers_dataset.csv
+├── olist_products_dataset.csv
+├── product_category_name_translation.csv
+├── olist_orders_dataset.csv
+├── olist_order_items_dataset.csv
+├── olist_order_payments_dataset.csv
+└── olist_order_reviews_dataset.csv
+```
+
+The geolocation file is not required.
+
+### 3. Configure environment variables
+
+Create your local environment file:
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and replace the placeholder values. At minimum, set:
+
+- `OPENAI_API_KEY` — your OpenAI API key;
+- `APP_PASSWORD` — the password users will enter in the web interface;
+- `AUTH_SECRET` — a strong secret used to sign session tokens; and
+- the PostgreSQL, read-only, and audit database passwords.
+
+You can generate a value for `AUTH_SECRET` with:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+You can also set `OPENAI_MODEL`, `ALLOWED_USERS`, `DAILY_LIMIT_PER_USER`, and `DAILY_LIMIT_GLOBAL`. When `ALLOWED_USERS` is empty, any valid username can sign in with the shared application password. Set it to a comma-separated list to restrict usernames.
+
+**Do not commit your `.env` file or real API keys and passwords.** The values in `.env.example` are placeholders, not production credentials.
+
+### 4. Start the application
+
+```bash
+make run
+```
+
+On the first run, this command builds the application image, starts PostgreSQL, API, and Streamlit services, waits for the services to become healthy, and loads the CSV files when the database is empty and the expected data is present.
+
+Once everything is running, open:
+
+- **Web interface:** [http://127.0.0.1:8501](http://127.0.0.1:8501)
+- **FastAPI documentation:** [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+Sign in with a username permitted by `ALLOWED_USERS` (or any valid username when the allowlist is empty) and the `APP_PASSWORD` configured in `.env`.
+
+If the CSV files are missing when the application starts, the services can still start, but the database will be empty and data questions will not return meaningful results.
+
+### 5. Useful commands
+
+| Command | What it does |
+|---|---|
+| `make run` | Build and start the database, API, and UI |
+| `make status` | Show container status |
+| `make logs` | Follow service logs |
+| `make restart` | Restart the services |
+| `make stop` | Stop and remove containers while keeping database data |
+| `make clean` | Stop containers and delete the database volume |
+| `make help` | Show available Makefile commands |
+
+**Note:** `make clean` permanently removes the PostgreSQL Docker volume. Use it only when you intend to delete the loaded database and start fresh.
+
+## API overview
+
+The FastAPI service exposes these endpoints:
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /login` | `{username, password}` -> bearer token |
-| `POST /ask` | `{question}` -> `{status, sql, columns, rows, summary, remaining_today, ...}` |
-| `GET /history` | Recent questions across the team |
-| `GET /usage` | Your remaining daily quota |
-| `GET /health` | Liveness |
+| `POST /login` | Verify credentials and return a bearer token |
+| `POST /ask` | Generate, validate, execute, and summarize a question |
+| `GET /history` | View recent questions shared across the team |
+| `GET /usage` | Check the authenticated user's remaining daily quota |
+| `GET /health` | Health check |
 
-`status` is one of `ok`, `cannot_answer`, `blocked`, `error`. Over-quota requests get HTTP 429.
+The interactive API reference is available at `http://127.0.0.1:8000/docs` while the application is running. Endpoints other than login and health require a valid bearer token.
 
-## Schema-aware prompting
+## Testing and evaluation
 
-[db/schema_card.yaml](db/schema_card.yaml) is the single source of truth. It feeds the prompt (tables, columns, joins, business glossary, data quirks, query rules) **and** the guard's table allowlist. Most of the accuracy comes from this file, not the model. Examples of what it encodes:
+### Run the test suite
 
-- **"Customer"** means `COUNT(DISTINCT customer_unique_id)`. `customer_id` is per order (96,096 people vs 99,441 ids).
-- **"Revenue"** means `SUM(price)` over delivered orders, excluding freight unless asked.
-- **Fan-out rule:** aggregate `order_items` and `order_payments` separately before joining. Joining both to `orders` inflates revenue by ~4.5% (13.81M vs 13.22M).
-- **Data quirks:** 13 categories have no English translation, 610 products have no category, ~550 orders have several reviews.
+Install the development dependencies and run the tests:
 
-To point the system at another domain, replace this file and the seed data.
+```bash
+make setup
+make test
+```
 
-## Evaluation
+The test suite covers the SQL guard, API behavior, rate limiting, UI behavior, and evaluation comparison logic. The tests are designed to run without making OpenAI API calls.
 
-[eval/golden_queries.yaml](eval/golden_queries.yaml) holds 30 tuned-on questions, 10 holdout questions written after the first baseline run, and 8 questions that must be refused. Each answerable question has hand-written reference SQL. A generated query passes if executing it returns the same rows as the reference (extra or renamed columns allowed, floats within tolerance). This is *execution accuracy*, not string matching.
+### Evaluate generated SQL
 
-Results with `gpt-4o-mini`, three full runs (`make eval`):
+```bash
+make eval
+```
 
-| | Result |
-|---|---|
-| Answerable questions (40) | **90-92%** (36-37 correct) |
-| Tuned-on set (30) | 90-97% |
-| Holdout set (10) | 80-90% |
-| Refusals (8): injection, DROP, predictions, off-topic, review text | **100%** in every run |
-| First baseline, before any prompt changes | 27/30 (90%) |
+The evaluation uses hand-written reference SQL for answerable questions. SQLSentry generates a query, executes it, and compares the returned rows with the reference result. This measures **execution accuracy** rather than whether the generated SQL string exactly matches the reference query.
 
-What this does and does not show:
+The evaluation calls the configured OpenAI model and requires a populated local database. Results are written under `eval/results/`. Because model outputs can vary between runs and the holdout set is limited, treat a single run as an indication of performance rather than a definitive benchmark.
 
-- Output varies between runs even at `temperature=0`, so single-run numbers are noisy. The holdout set is only 10 questions; treat the gap between sets as indicative, not proven.
-- Prompt changes after the baseline fixed one failure consistently (counting groups that satisfy a `HAVING` condition). A rule against adding unrequested filters did **not** reliably fix its target case.
-- **Persistent failures:** a false refusal on a month-over-month growth question ("no data for November 2017", which exists); counting distinct English category names instead of falling back to the Portuguese name for untranslated categories; occasionally adding an unrequested filter to a delivery-time count; and sometimes omitting the delivered-orders filter on revenue.
-- **Grader limits:** one case (`h08`) is graded on numeric values only, because the model's labels (`late`/`on_time`) and the reference's (`true`/`false`) have no canonical spelling. `YYYY-MM` is treated as equal to the first of that month. Both are in [eval/compare.py](eval/compare.py).
-- The reference answers are mine and could contain mistakes on ambiguous questions.
+## Limitations and current scope
 
-## Design decisions and trade-offs
+SQLSentry is a project prototype built around one dataset and a descriptive analytics use case. A few boundaries are important to understand:
 
-- **AST parsing over keyword blocklists.** A regex for `DROP|UPDATE|DELETE` is bypassed by CTE-wrapped writes, comments and stacked statements. Parsing sees the structure. A parser can still miss things, so the DB role is the real backstop.
-- **Self-repair over failing.** DB errors go back to the model (up to 2 retries). This fixed type errors like `round(interval, integer)` on its own, at the cost of extra latency and tokens. All attempts are logged.
-- **Structured refusal.** The model returns `can_answer=false` rather than inventing columns. This costs some false refusals (see above).
-- **Quota counted from the audit log.** Limits survive restarts and need no extra infrastructure. The in-flight tracking that stops parallel requests slipping past the limit is per process, so with several server workers a user could slightly exceed it.
-- **Whole schema in the prompt.** Fine for 8 tables. For hundreds of tables you would add retrieval to select relevant tables first.
-- **Tokens, not sessions.** Stateless signed tokens keep the API simple; they cannot be revoked individually before expiry.
+- **Dataset-specific:** the schema card, table allowlist, and business definitions are currently written for the Olist dataset. Supporting another database requires updating these pieces and loading compatible data.
+- **No conversation memory:** each question is handled independently. Follow-up questions such as “now break that down by state” do not carry context from the previous question.
+- **Descriptive, not predictive:** SQLSentry can query historical data, but it does not forecast churn, explain causality, or make predictions.
+- **Result limit:** query output is capped at 1,000 rows by default.
+- **Shared-password authentication:** when `ALLOWED_USERS` is not configured, anyone with the shared password can choose a valid username. This is not the same as individual identity management.
+- **In-memory login throttling:** failed-login tracking is held in process memory and resets when the API process restarts. It is not a distributed rate limiter. Daily usage is counted from the audit log, but in-flight request reservations are process-local, so a multi-worker deployment would need shared coordination for strict concurrent quota enforcement.
+- **Deployment hardening:** the included Compose configuration binds service ports to localhost. Do not expose the app or PostgreSQL directly to the public internet. A hosted deployment needs HTTPS, strong secrets, restricted network access, and a review of the authentication and rate-limiting model.
 
-## Limitations
-
-- Shared password plus self-chosen usernames: someone with the password can pick a new name to get a fresh per-user quota. The global daily cap bounds total spend; set `ALLOWED_USERS` for real per-person limits.
-- Login lockout is per IP and in-memory (resets on restart; behind a proxy all users may share one IP).
-- No conversation memory: each question is independent, so follow-ups like "and by state?" do not work yet.
-- `SELECT *` on `order_reviews` is rejected by Postgres (comment columns are not granted) and relies on the repair loop.
-- Descriptive only: no forecasting or causal analysis.
-- Results are capped at 1,000 rows; the UI says when that happens.
-
-## Deployment notes
-
-- `docker-compose.yml` (started by `make run`) runs Postgres, API and UI; ports bind to `127.0.0.1`. To host it, put a TLS-terminating reverse proxy in front (Caddy, nginx, or a managed platform) and keep Postgres unexposed.
-- Change every password in `.env` and use a fresh `AUTH_SECRET`. The `.env.example` values are placeholders.
-- Set an OpenAI spend limit on the key. The global daily cap (`DAILY_LIMIT_GLOBAL`) is the second line of defence.
-- Free hosting tiers sleep when idle; the first request can take a while.
-- Before pushing to a public repo, run `make secrets-check`.
+The safety layers reduce the risk of unsafe generated SQL, but this project should not be treated as a formally audited security product or as a substitute for database access controls and deployment security practices.
 
 ## Project structure
 
+```text
+sqlsentry/
+├── app/
+│   ├── main.py             # FastAPI routes and application setup
+│   ├── pipeline.py         # Generate → guard → execute → repair → summarize → audit
+│   ├── generate_sql.py     # OpenAI-based SQL generation
+│   ├── sql_guard.py        # SQL parsing and validation
+│   ├── execute.py          # Read-only PostgreSQL query execution
+│   ├── summarize.py        # Short summaries from a capped result sample
+│   ├── audit.py             # Query audit log
+│   ├── auth.py              # Password checks and signed tokens
+│   ├── ratelimit.py         # Per-user and global daily quotas
+│   ├── schema_card.py       # Loads schema context
+│   └── config.py            # Environment-based settings
+├── ui/
+│   └── streamlit_app.py    # Streamlit user interface
+├── db/
+│   ├── init/               # Database schema, audit schema, and roles
+│   └── schema_card.yaml    # Tables, joins, business rules, and query guidance
+├── eval/                   # Golden questions, reference SQL, and evaluator
+├── scripts/                # Data loading, startup, and utility scripts
+├── tests/                  # Automated tests
+├── data/                   # Local Olist CSV files (not committed)
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+├── requirements.txt
+└── requirements-dev.txt
 ```
-app/
-  main.py          FastAPI endpoints
-  pipeline.py      generate -> guard -> execute -> repair loop, summary, audit
-  generate_sql.py  prompt + OpenAI structured output
-  sql_guard.py     AST-based SQL validation
-  execute.py       read-only execution with timeout and row cap
-  summarize.py     summary from a capped sample
-  audit.py         append-only audit log, daily counts
-  auth.py          password check, signed tokens, login throttle
-  ratelimit.py     per-user and global daily limits
-  schema_card.py   loads and renders the schema card
-  config.py        settings from environment
-ui/streamlit_app.py
-db/
-  init/            schema, audit schema, roles (run on first container start)
-  schema_card.yaml
-eval/              golden queries, comparator, runner
-scripts/           data loader, secrets check, manual question runner
-tests/             guard, API, rate limit, UI and comparator tests
-```
-
-Run the tests with `make test` (97 tests, no OpenAI calls).
-
-## Possible improvements
-
-- Few-shot examples drawn from the golden query pairs
-- Table retrieval for large schemas
-- Join suggestions from foreign keys
-- Per-user table and column access (RBAC)
-- Conversation memory for follow-up questions
-- Charts for numeric results
 
 ## Data and license
 
-Code: MIT, see [LICENSE](LICENSE). Data: Olist Brazilian E-Commerce Public Dataset, released under CC BY-NC-SA 4.0 (attribution, non-commercial, share-alike). The CSVs are not redistributed here; download them from Kaggle.
+- **Code:** MIT License. See [`LICENSE`](LICENSE).
+- **Dataset:** Olist Brazilian E-Commerce Public Dataset, subject to its [CC BY-NC-SA 4.0 license](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce). The dataset files are not redistributed in this repository; download them from Kaggle and follow the dataset's attribution and license terms.
+
+---
+
+*SQLSentry is an exploration of how natural-language interfaces, schema-aware prompting, SQL validation, and database permissions can work together to make analytical database queries more approachable and more inspectable.*
